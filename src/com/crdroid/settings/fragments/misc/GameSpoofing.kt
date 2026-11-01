@@ -73,13 +73,21 @@ import org.json.JSONObject
 import java.util.Locale
 
 /**
- * Per-game Build property overrides, stored as JSON in spoof_gameprops_config and applied by
- * GamePropsSpoofService when the game's process starts:
+ * Per-app identity spoofing, stored as JSON in spoof_gameprops_config. Each app picks one of two
+ * modes:
  *
- *     { "enabled": true, "debug": false, "games": { "<pkg>": { "MODEL": "...", ... } } }
+ *  - Device identity: Build field overrides, applied by GamePropsSpoofService.
+ *  - CPU / GPU model: renderer, Vulkan device and CPU info, applied by
+ *    com.android.internal.util.AdvancedAppSpoofUtils (adapted from DerpFest, author kenway214).
  *
- * The service loads the config once per process, so every change force-stops the games it
- * touches.
+ *     {
+ *       "enabled": true,
+ *       "debug": false,
+ *       "games":    { "<pkg>": { "MODEL": "...", ... } },
+ *       "hardware": { "<pkg>": { "gpu": "adreno830", "cpu": "sd8elite" } }
+ *     }
+ *
+ * Both services load the config once per process, so every change force-stops the apps it touches.
  */
 class GameSpoofing : SettingsPreferenceFragment() {
 
@@ -87,12 +95,30 @@ class GameSpoofing : SettingsPreferenceFragment() {
         val packageName: String,
         val label: String,
         val icon: Drawable?,
-        val props: Map<String, String>,
-    )
+        val props: Map<String, String> = emptyMap(),
+        val gpu: String = "",
+        val cpu: String = "",
+    ) {
+        /** An app is in exactly one mode: it has Build overrides, or a CPU/GPU rule, never both. */
+        val hardwareMode: Boolean get() = gpu.isNotEmpty() || cpu.isNotEmpty()
+    }
 
     internal sealed interface GsDialog {
         object AddGame : GsDialog
+        class Mode(val packageName: String, val label: String) : GsDialog
         class Profile(val packageName: String, val label: String) : GsDialog
+        class Gpu(
+            val packageName: String,
+            val label: String,
+            val currentGpu: String,
+            val currentCpu: String,
+        ) : GsDialog
+        class Cpu(
+            val packageName: String,
+            val label: String,
+            val gpu: String,
+            val currentCpu: String,
+        ) : GsDialog
         class EditProps(val packageName: String, val label: String, val props: Map<String, String>) : GsDialog
         class Remove(val packageName: String, val label: String) : GsDialog
     }
@@ -110,7 +136,7 @@ class GameSpoofing : SettingsPreferenceFragment() {
     private val ui = GsUiState()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-    /** Config keys other than "enabled" and "games" (e.g. "debug"), written back unchanged. */
+    /** Config keys the screen does not own (e.g. "debug"), written back unchanged. */
     private var extraKeys: JSONObject = JSONObject()
 
     /** Bumped on every save, so a load that started before the save doesn't overwrite it. */
@@ -136,9 +162,10 @@ class GameSpoofing : SettingsPreferenceFragment() {
                     onEnabledChange = fragment::setSpoofingEnabled,
                     onAddGame = fragment::openAddGame,
                     onPickApp = { app ->
-                        ui.dialog = GsDialog.Profile(app.packageName, app.label)
+                        ui.dialog = GsDialog.Mode(app.packageName, app.label)
                     },
                     onPickProfile = fragment::applyProfile,
+                    onSaveHardware = fragment::saveHardware,
                     onSaveProps = fragment::saveProps,
                     onRemove = fragment::removeGame,
                 )
@@ -164,19 +191,21 @@ class GameSpoofing : SettingsPreferenceFragment() {
         val startedAt = saveGeneration
         scope.launch {
             val pm = requireContext().packageManager
-            val (enabled, games, extras) = withContext(Dispatchers.IO) {
+            val (enabled, rules, extras) = withContext(Dispatchers.IO) {
                 val content = Settings.Secure.getString(
                     requireContext().contentResolver, GAMEPROPS_CONFIG_KEY)
                 val parsed = parseConfig(content)
                 Triple(
                     parsed.first,
-                    parsed.second.map { (pkg, props) ->
-                        val info = runCatching { pm.getApplicationInfo(pkg, 0) }.getOrNull()
+                    parsed.second.map { rule ->
+                        val info = runCatching { pm.getApplicationInfo(rule.pkg, 0) }.getOrNull()
                         GameEntry(
-                            packageName = pkg,
-                            label = info?.let { pm.getApplicationLabel(it).toString() } ?: pkg,
+                            packageName = rule.pkg,
+                            label = info?.let { pm.getApplicationLabel(it).toString() } ?: rule.pkg,
                             icon = info?.let { runCatching { pm.getApplicationIcon(it) }.getOrNull() },
-                            props = props,
+                            props = rule.props,
+                            gpu = rule.gpu,
+                            cpu = rule.cpu,
                         )
                     }.sortedBy { it.label.lowercase(Locale.getDefault()) },
                     parsed.third,
@@ -190,7 +219,7 @@ class GameSpoofing : SettingsPreferenceFragment() {
             ui.enabled = enabled
             extraKeys = extras
             ui.games.clear()
-            ui.games.addAll(games)
+            ui.games.addAll(rules)
             ui.loading = false
         }
     }
@@ -201,12 +230,26 @@ class GameSpoofing : SettingsPreferenceFragment() {
             val json = JSONObject(extraKeys.toString())
             json.put("enabled", ui.enabled)
             val gamesObj = JSONObject()
+            val hardwareObj = JSONObject()
             ui.games.forEach { game ->
-                val propsObj = JSONObject()
-                game.props.forEach { (k, v) -> propsObj.put(k, v) }
-                gamesObj.put(game.packageName, propsObj)
+                if (game.props.isEmpty() && !game.hardwareMode) return@forEach
+                if (game.hardwareMode) {
+                    hardwareObj.put(game.packageName, JSONObject().apply {
+                        if (game.gpu.isNotEmpty()) put("gpu", game.gpu)
+                        if (game.cpu.isNotEmpty()) put("cpu", game.cpu)
+                    })
+                } else {
+                    val propsObj = JSONObject()
+                    game.props.forEach { (k, v) -> propsObj.put(k, v) }
+                    gamesObj.put(game.packageName, propsObj)
+                }
             }
             json.put("games", gamesObj)
+            if (hardwareObj.length() > 0) {
+                json.put("hardware", hardwareObj)
+            } else {
+                json.remove("hardware")
+            }
             Settings.Secure.putString(
                 requireContext().contentResolver, GAMEPROPS_CONFIG_KEY, json.toString(2))
         } catch (e: Exception) {
@@ -256,20 +299,44 @@ class GameSpoofing : SettingsPreferenceFragment() {
             ui.dialog = GsDialog.EditProps(packageName, label, existing)
             return
         }
-        upsertGame(packageName, label, props)
+        saveProps(packageName, label, props)
     }
 
     private fun saveProps(packageName: String, label: String, props: Map<String, String>) {
-        if (props.isEmpty()) removeGame(packageName) else upsertGame(packageName, label, props)
+        // Saving an empty identity drops the rule: an app is only listed while it spoofs something.
+        if (props.isEmpty()) {
+            removeGame(packageName)
+            return
+        }
+        upsertGame(packageName, label, props = props)
     }
 
-    private fun upsertGame(packageName: String, label: String, props: Map<String, String>) {
+    private fun saveHardware(
+        packageName: String,
+        label: String,
+        gpu: String = "",
+        cpu: String = "",
+    ) {
+        if (gpu.isEmpty() && cpu.isEmpty()) {
+            removeGame(packageName)
+            return
+        }
+        upsertGame(packageName, label, props = emptyMap(), gpu = gpu, cpu = cpu)
+    }
+
+    private fun upsertGame(
+        packageName: String,
+        label: String,
+        props: Map<String, String> = emptyMap(),
+        gpu: String = "",
+        cpu: String = "",
+    ) {
         val index = ui.games.indexOfFirst { it.packageName == packageName }
         if (index >= 0) {
-            ui.games[index] = ui.games[index].copy(props = props)
+            ui.games[index] = ui.games[index].copy(props = props, gpu = gpu, cpu = cpu)
         } else {
             val icon = ui.installedApps.firstOrNull { it.packageName == packageName }?.icon
-            ui.games.add(GameEntry(packageName, label, icon, props))
+            ui.games.add(GameEntry(packageName, label, icon, props, gpu, cpu))
             ui.games.sortBy { it.label.lowercase(Locale.getDefault()) }
         }
         saveConfig()
@@ -301,27 +368,97 @@ class GameSpoofing : SettingsPreferenceFragment() {
         internal fun profileName(props: Map<String, String>): String? =
             PRESET_PROFILES.firstOrNull { it.second == props }?.first
 
-        /** (enabled, games, other top-level keys) from the stored JSON. */
+        /**
+         * CPU / GPU presets, mirroring AdvancedAppSpoofUtils. Kept here because the fragment cannot
+         * reach that @hide class from the app process.
+         */
+        internal val GPU_PRESETS: LinkedHashMap<String, String> = linkedMapOf(
+            "adreno840"    to "Adreno 840  \u00b7  Snapdragon 8 Elite Gen 5",
+            "adreno830"    to "Adreno 830  \u00b7  Snapdragon 8 Elite",
+            "adreno750"    to "Adreno 750  \u00b7  Snapdragon 8 Gen 3",
+            "adreno740"    to "Adreno 740  \u00b7  Snapdragon 8 Gen 2",
+            "adreno735"    to "Adreno 735  \u00b7  Snapdragon 8s Gen 3",
+            "adreno730"    to "Adreno 730  \u00b7  Snapdragon 8 Gen 1",
+            "adreno720"    to "Adreno 720  \u00b7  Snapdragon 7s Gen 3",
+            "mali_g925"    to "Mali-G925 Immortalis  \u00b7  Dimensity 9400",
+            "mali_g920"    to "Mali-G920 Immortalis  \u00b7  Dimensity 9400+",
+            "mali_g720"    to "Mali-G720 Immortalis  \u00b7  Dimensity 9300",
+            "mali_g715"    to "Mali-G715 Immortalis  \u00b7  Dimensity 9200+",
+            "mali_g615"    to "Mali-G615  \u00b7  Dimensity 8300 / 8350",
+            "mali_g78"     to "Mali-G78 MP24  \u00b7  Kirin 9000",
+            "maleoon930"   to "Maleoon 930  \u00b7  Kirin 9030 Pro / 9030S",
+            "maleoon920"   to "Maleoon 920  \u00b7  Kirin 9020",
+            "maleoon910"   to "Maleoon 910  \u00b7  Kirin 9010",
+            "xclipse940"   to "Samsung Xclipse 940  \u00b7  Exynos 2400",
+            "xclipse920"   to "Samsung Xclipse 920  \u00b7  Exynos 2200",
+            "apple_a18pro" to "Apple A18 Pro GPU",
+            "apple_a17pro" to "Apple A17 Pro GPU",
+        )
+
+        internal val CPU_PRESETS: LinkedHashMap<String, String> = linkedMapOf(
+            "sd8elitegen5"      to "Snapdragon 8 Elite Gen 5 (SM8850)",
+            "sd8elite"          to "Snapdragon 8 Elite (SM8750)",
+            "sd8gen3"           to "Snapdragon 8 Gen 3 (SM8650)",
+            "sd8gen2"           to "Snapdragon 8 Gen 2 (SM8550)",
+            "dimensity9400plus" to "Dimensity 9400+ (MT6991)",
+            "dimensity9400"     to "Dimensity 9400 (MT6989)",
+            "dimensity8350"     to "Dimensity 8350 (MT6897)",
+            "kirin9030pro"      to "Kirin 9030 Pro",
+            "kirin9030s"        to "Kirin 9030S",
+            "kirin9020"         to "Kirin 9020",
+            "kirin9020a"        to "Kirin 9020A",
+            "kirin9000s"        to "Kirin 9000S",
+            "kirin9000"         to "Kirin 9000",
+            "xuanjie_o1"        to "Xiaomi Xring O1",
+            "xuanjie_o3"        to "Xiaomi Xring O3",
+        )
+
+        internal fun gpuName(key: String): String? = GPU_PRESETS[key]
+        internal fun cpuName(key: String): String? = CPU_PRESETS[key]
+
+        /** One entry of the stored config, before it is resolved to an app label and icon. */
+        internal data class Rule(
+            val pkg: String,
+            val props: Map<String, String> = emptyMap(),
+            val gpu: String = "",
+            val cpu: String = "",
+        ) {
+            val hardwareMode: Boolean get() = gpu.isNotEmpty() || cpu.isNotEmpty()
+        }
+
+        /** (enabled, rules, other top-level keys) from the stored JSON. */
         private fun parseConfig(
             content: String?,
-        ): Triple<Boolean, List<Pair<String, Map<String, String>>>, JSONObject> {
+        ): Triple<Boolean, List<Rule>, JSONObject> {
             if (content.isNullOrBlank()) return Triple(false, emptyList(), JSONObject())
             return try {
                 val json = JSONObject(content)
-                val games = mutableListOf<Pair<String, Map<String, String>>>()
+                val rules = linkedMapOf<String, Rule>()
                 json.optJSONObject("games")?.let { gamesObj ->
                     gamesObj.keys().forEach { pkg ->
                         val propsObj = gamesObj.optJSONObject(pkg) ?: return@forEach
                         val props = linkedMapOf<String, String>()
                         propsObj.keys().forEach { k -> props[k] = propsObj.optString(k) }
-                        games += pkg to props
+                        rules[pkg] = Rule(pkg = pkg, props = props)
+                    }
+                }
+                json.optJSONObject("hardware")?.let { hardwareObj ->
+                    hardwareObj.keys().forEach { pkg ->
+                        val ruleObj = hardwareObj.optJSONObject(pkg) ?: return@forEach
+                        rules[pkg] = Rule(
+                            pkg = pkg,
+                            gpu = ruleObj.optString("gpu"),
+                            cpu = ruleObj.optString("cpu"),
+                        )
                     }
                 }
                 val extras = JSONObject()
                 json.keys().forEach { k ->
-                    if (k != "enabled" && k != "games") extras.put(k, json.get(k))
+                    if (k != "enabled" && k != "games" && k != "hardware") {
+                        extras.put(k, json.get(k))
+                    }
                 }
-                Triple(json.optBoolean("enabled", false), games, extras)
+                Triple(json.optBoolean("enabled", false), rules.values.toList(), extras)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to load config", e)
                 Triple(false, emptyList(), JSONObject())
@@ -341,10 +478,11 @@ private fun GameSpoofingContent(
     onAddGame: () -> Unit,
     onPickApp: (AppListEntry) -> Unit,
     onPickProfile: (String, String, Map<String, String>?) -> Unit,
+    onSaveHardware: (String, String, String, String) -> Unit,
     onSaveProps: (String, String, Map<String, String>) -> Unit,
     onRemove: (String) -> Unit,
 ) {
-    GsDialogs(state, onPickApp, onPickProfile, onSaveProps, onRemove)
+    GsDialogs(state, onPickApp, onPickProfile, onSaveHardware, onSaveProps, onRemove)
 
     SpoofScreen {
         SpoofingHeaderCard(
@@ -394,11 +532,16 @@ private fun GameSpoofingContent(
                             dimmed = !state.enabled,
                             shape = SpoofShapes.forIndex(index, state.games.size),
                             onEdit = {
-                                state.dialog = GameSpoofing.GsDialog.EditProps(
-                                    game.packageName, game.label, game.props)
+                                state.dialog = if (game.hardwareMode) {
+                                    GameSpoofing.GsDialog.Gpu(
+                                        game.packageName, game.label, game.gpu, game.cpu)
+                                } else {
+                                    GameSpoofing.GsDialog.EditProps(
+                                        game.packageName, game.label, game.props)
+                                }
                             },
-                            onProfile = {
-                                state.dialog = GameSpoofing.GsDialog.Profile(
+                            onMode = {
+                                state.dialog = GameSpoofing.GsDialog.Mode(
                                     game.packageName, game.label)
                             },
                             onRemove = {
@@ -421,7 +564,7 @@ private fun GameCard(
     dimmed: Boolean,
     shape: androidx.compose.ui.graphics.Shape,
     onEdit: () -> Unit,
-    onProfile: () -> Unit,
+    onMode: () -> Unit,
     onRemove: () -> Unit,
 ) {
     Surface(
@@ -451,14 +594,26 @@ private fun GameCard(
                 }
                 Spacer(Modifier.width(8.dp))
                 SpoofStatusChip(
-                    text = GameSpoofing.profileName(game.props)
-                        ?: stringResource(R.string.gs_profile_custom),
+                    text = if (game.hardwareMode) {
+                        stringResource(R.string.gs_mode_hardware_short)
+                    } else {
+                        GameSpoofing.profileName(game.props)
+                            ?: stringResource(R.string.gs_profile_custom)
+                    },
                     tone = if (dimmed) SpoofTone.Neutral else SpoofTone.Positive,
                 )
             }
             Spacer(Modifier.height(8.dp))
             Text(
-                text = game.props.entries.joinToString("  \u00b7  ") { "${it.key}=${it.value}" },
+                text = when {
+                    game.hardwareMode -> listOfNotNull(
+                        game.gpu.takeIf { it.isNotEmpty() }
+                            ?.let { GameSpoofing.gpuName(it) ?: it },
+                        game.cpu.takeIf { it.isNotEmpty() }
+                            ?.let { GameSpoofing.cpuName(it) ?: it },
+                    ).joinToString("  \u00b7  ")
+                    else -> game.props.entries.joinToString("  \u00b7  ") { "${it.key}=${it.value}" }
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -467,8 +622,8 @@ private fun GameCard(
                 listOf(
                     SpoofAction(stringResource(R.string.gs_edit_props_short), Icons.Rounded.Edit,
                         onClick = onEdit),
-                    SpoofAction(stringResource(R.string.gs_profile_short), Icons.Rounded.SwapHoriz,
-                        onClick = onProfile),
+                    SpoofAction(stringResource(R.string.gs_mode_short), Icons.Rounded.SwapHoriz,
+                        onClick = onMode),
                     SpoofAction(stringResource(R.string.gs_remove), Icons.Rounded.DeleteOutline,
                         onClick = onRemove),
                 ),
@@ -482,6 +637,7 @@ private fun GsDialogs(
     state: GameSpoofing.GsUiState,
     onPickApp: (AppListEntry) -> Unit,
     onPickProfile: (String, String, Map<String, String>?) -> Unit,
+    onSaveHardware: (String, String, String, String) -> Unit,
     onSaveProps: (String, String, Map<String, String>) -> Unit,
     onRemove: (String) -> Unit,
 ) {
@@ -493,6 +649,64 @@ private fun GsDialogs(
             apps = state.installedApps,
             configured = state.games.map { it.packageName }.toSet(),
             onPick = { app -> dismiss(); onPickApp(app) },
+            onDismiss = dismiss,
+        )
+        is GameSpoofing.GsDialog.Mode -> {
+            val current = state.games.firstOrNull { it.packageName == dialog.packageName }
+            SpoofChoiceDialog(
+                title = stringResource(R.string.gs_spoof_mode),
+                options = listOf(
+                    stringResource(R.string.gs_mode_device),
+                    stringResource(R.string.gs_mode_hardware),
+                ),
+                summaries = listOf(
+                    stringResource(R.string.gs_mode_device_summary),
+                    stringResource(R.string.gs_mode_hardware_summary),
+                ),
+                selected = if (current?.hardwareMode == true) 1 else 0,
+                onPick = { index ->
+                    state.dialog = if (index == 1) {
+                        GameSpoofing.GsDialog.Gpu(
+                            dialog.packageName, dialog.label,
+                            current?.gpu.orEmpty(), current?.cpu.orEmpty(),
+                        )
+                    } else {
+                        GameSpoofing.GsDialog.Profile(dialog.packageName, dialog.label)
+                    }
+                },
+                onDismiss = dismiss,
+            )
+        }
+        // Hardware mode is a two-step pick: GPU first, then CPU. Dismissing either step leaves the
+        // stored rule untouched, so a half-configured app never reaches the service.
+        is GameSpoofing.GsDialog.Gpu -> SpoofChoiceDialog(
+            title = stringResource(R.string.gs_select_gpu),
+            options = listOf(stringResource(R.string.gs_hardware_none)) +
+                GameSpoofing.GPU_PRESETS.values.toList(),
+            selected = GameSpoofing.GPU_PRESETS.keys.indexOf(dialog.currentGpu) + 1,
+            onPick = { index ->
+                state.dialog = GameSpoofing.GsDialog.Cpu(
+                    dialog.packageName,
+                    dialog.label,
+                    GameSpoofing.GPU_PRESETS.keys.elementAtOrNull(index - 1).orEmpty(),
+                    dialog.currentCpu,
+                )
+            },
+            onDismiss = dismiss,
+        )
+        is GameSpoofing.GsDialog.Cpu -> SpoofChoiceDialog(
+            title = stringResource(R.string.gs_select_cpu),
+            options = listOf(stringResource(R.string.gs_hardware_none)) +
+                GameSpoofing.CPU_PRESETS.values.toList(),
+            selected = GameSpoofing.CPU_PRESETS.keys.indexOf(dialog.currentCpu) + 1,
+            onPick = { index ->
+                val cpu = GameSpoofing.CPU_PRESETS.keys.elementAtOrNull(index - 1).orEmpty()
+                if (cpu.isEmpty() && dialog.gpu.isEmpty()) {
+                    onRemove(dialog.packageName)
+                } else {
+                    onSaveHardware(dialog.packageName, dialog.label, dialog.gpu, cpu)
+                }
+            },
             onDismiss = dismiss,
         )
         is GameSpoofing.GsDialog.Profile -> {

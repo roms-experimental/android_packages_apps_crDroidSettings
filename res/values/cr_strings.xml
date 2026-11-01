@@ -1613,7 +1613,7 @@ A small donation helps keep this project alive and improving. You can dismiss th
     <string name="tricky_store_title">TrickyStore</string>
     <string name="tricky_store_summary">Manage keybox and target apps for attestation for strong integrity</string>
     <string name="game_spoofing_title">Game spoofing</string>
-    <string name="game_spoofing_summary">Spoof device properties for specific games</string>
+    <string name="game_spoofing_summary">Spoof device identity or CPU / GPU model for specific apps</string>
 
     <!-- Spoofing: shared -->
     <string name="spoof_wipe_playstore_title">Clear Play Store data?</string>
@@ -1779,18 +1779,17 @@ A small donation helps keep this project alive and improving. You can dismiss th
 
     <!-- Game Spoofing -->
     <string name="gs_disabled">Disabled</string>
-    <string name="gs_configured_count">%d games configured</string>
-    <string name="gs_add_app">Add game</string>
-    <string name="gs_configured_apps">Configured games</string>
-    <string name="gs_no_apps">No games configured</string>
-    <string name="gs_no_apps_summary">Tap \"Add game\" to get started</string>
+    <string name="gs_configured_count">%d apps configured</string>
+    <string name="gs_add_app">Add app</string>
+    <string name="gs_configured_apps">Configured apps</string>
+    <string name="gs_no_apps">No apps configured</string>
+    <string name="gs_no_apps_summary">Tap \"Add app\" to get started</string>
     <string name="gs_no_matching_apps">No matching apps</string>
     <string name="gs_select_app">Select app</string>
     <string name="gs_select_profile">Select device profile</string>
     <string name="gs_profile_custom">Custom</string>
     <string name="gs_profile_custom_ellipsis">Custom…</string>
     <string name="gs_edit_props_short">Edit</string>
-    <string name="gs_profile_short">Profile</string>
     <string name="gs_remove">Remove</string>
     <string name="gs_remove_title">Remove game?</string>
     <string name="gs_remove_message">Remove %s from game spoofing?</string>
@@ -1802,7 +1801,17 @@ A small donation helps keep this project alive and improving. You can dismiss th
     <string name="gs_invalid_key">Invalid field name: %s</string>
     <string name="gs_duplicate_key">Each field can only be set once</string>
     <string name="gs_save">Save</string>
-    <string name="gs_footer_body">The selected game sees the chosen device identity in its Build fields. Games are restarted when their configuration changes. Some games use this to unlock higher frame rates or graphics settings.</string>
+    <string name="gs_footer_body">Each app can be given a different device identity (Build fields) or a different CPU / GPU model. Apps are restarted when their configuration changes. Some games use this to unlock higher frame rates or graphics settings.</string>
+    <string name="gs_spoof_mode">Spoof mode</string>
+    <string name="gs_mode_device">Device identity</string>
+    <string name="gs_mode_device_summary">Spoof Build fields such as MODEL and MANUFACTURER</string>
+    <string name="gs_mode_hardware">CPU / GPU model</string>
+    <string name="gs_mode_hardware_summary">Spoof GPU renderer, Vulkan device and CPU info</string>
+    <string name="gs_mode_short">Mode</string>
+    <string name="gs_mode_hardware_short">Hardware</string>
+    <string name="gs_select_gpu">Select GPU</string>
+    <string name="gs_select_cpu">Select CPU</string>
+    <string name="gs_hardware_none">None</string>
 
     <!-- Build details -->
     <string name="build_maintainer_title">Device maintainer</string>
